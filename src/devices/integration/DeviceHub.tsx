@@ -1111,12 +1111,13 @@ function IntegrationDialog({
   const device = candidates.find(d => d.id === binding)
   const needsMobileModelSelection = !initial.instance && Boolean(device && isMobileRemoteDevice(device))
   const selectedPackage = kind ? packageFor(kind) : null
+  const hasDriverTarget = Boolean(binding || isNetworkManagedKind(kind))
   const needsWindowsDriverInstall = Boolean(
     native &&
     platform === 'windows' &&
     kind &&
     supportsWindowsDriver(kind) &&
-    binding &&
+    hasDriverTarget &&
     onInstallDriver &&
     controller.snapshot.runtime[currentInstanceId ?? '']?.driverInstalled !== true,
   )
@@ -1242,7 +1243,7 @@ function IntegrationDialog({
       pendingInstance.name === name.trim() &&
       pendingInstance.binding === (binding || null)
     ) {
-      if (pendingInstance.binding && needsWindowsDriverInstall) {
+      if ((pendingInstance.binding || isNetworkManagedKind(kind)) && needsWindowsDriverInstall) {
         await runWindowsDriverInstall(pendingInstance.id)
       } else {
         onComplete(pendingInstance.id)
@@ -1277,7 +1278,7 @@ function IntegrationDialog({
         native &&
         platform === 'windows' &&
         supportsWindowsDriver(kind) &&
-        saved.binding &&
+        (saved.binding || isNetworkManagedKind(kind)) &&
         onInstallDriver &&
         !driverAlreadyInstalled
       ) {
