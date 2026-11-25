@@ -1,15 +1,13 @@
-//! Lifecycle manager for the standalone Root-enumerated Quarbor Virtual HID
-//! Output node (`ROOT\QUARBORUNIVERSALKEYBOARDOUTPUT\AXONKEYMOBILE`).
+//! Quarbor keyboard output availability & standalone Root-enumerated virtual HID
+//! fallback installer (`ROOT\QUARBORUNIVERSALKEYBOARDOUTPUT\AXONKEYMOBILE`).
 //!
-//! Uses the existing WHQL/Quarbor-signed `QuarborUniversalKeyboardDriver.inf`
-//! (`VirtualOutput` section) without requiring any new driver signature:
-//! - Non-elevated status check (`probe_installed` / `cached_is_installed`)
-//!   inspects the exact PnP node in < 0.1 ms.
-//! - Elevated `--axonkey-mobile-vhid-admin <install|uninstall>` worker stages
-//!   `QuarborUniversalKeyboardDriver.inf` via `SetupCopyOEMInfW` and binds or
-//!   removes ONLY `ROOT\QUARBORUNIVERSALKEYBOARDOUTPUT\AXONKEYMOBILE` via
-//!   `DiInstallDevice` / `DiUninstallDevice`, leaving physical BLE remotes
-//!   (such as Xiaomi RC003 and its companion output node) completely untouched.
+//! - When any Quarbor Universal Keyboard device is ALREADY installed on the PC
+//!   (such as Xiaomi RC003 / CMIOT A15), `driver_availability` immediately reports
+//!   `installed = true` and reuses that existing driver in-process — ZERO reinstall
+//!   and ZERO UAC prompt needed.
+//! - Only on a PC that has never had any Quarbor Universal Keyboard device installed
+//!   does the user optionally install the standalone `AXONKEYMOBILE` Root-enumerated
+//!   output node bound to the existing WHQL/Quarbor-signed `QuarborUniversalKeyboardDriver.inf`.
 
 use std::{
     ffi::c_void,
@@ -39,7 +37,6 @@ use windows::{
 };
 
 pub const MOBILE_VHID_INSTANCE_ID: &str = r"ROOT\QUARBORUNIVERSALKEYBOARDOUTPUT\AXONKEYMOBILE";
-const MOBILE_VHID_SUBPATH: &str = r"QUARBORUNIVERSALKEYBOARDOUTPUT\AXONKEYMOBILE";
 const MOBILE_VHID_HARDWARE_ID: &str = r"ROOT\QUARBORUNIVERSALKEYBOARDOUTPUT";
 const MOBILE_VHID_DESCRIPTION: &str = "Quarbor Universal Keyboard Output (Axonkey Mobile)";
 pub const ADMIN_CLI_FLAG: &str = "--axonkey-mobile-vhid-admin";
@@ -173,20 +170,13 @@ pub fn invalidate_probe_cache() {
     }
 }
 
-pub fn cached_is_installed() -> bool {
-    const TTL: Duration = Duration::from_millis(1500);
-    if let Ok(guard) = PROBE_CACHE.lock() {
-        if let Some((at, installed)) = *guard {
-            if at.elapsed() < TTL {
-                return installed;
-            }
-        }
+fn normalize_win32_path(path: PathBuf) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if let Some(stripped) = raw.strip_prefix(r"\\?\") {
+        PathBuf::from(stripped)
+    } else {
+        path
     }
-    let installed = probe_installed().unwrap_or(false);
-    if let Ok(mut guard) = PROBE_CACHE.lock() {
-        *guard = Some((Instant::now(), installed));
-    }
-    installed
 }
 
 fn to_wide_null(s: &str) -> Vec<u16> {
@@ -234,9 +224,9 @@ fn has_bound_driver(set: &DeviceSet, info: &SP_DEVINFO_DATA) -> bool {
     size > 2
 }
 
-/// Fast (< 0.1 ms) non-elevated check whether `ROOT\QUARBORUNIVERSALKEYBOARDOUTPUT\AXONKEYMOBILE`
-/// exists, is online (`DEVPKEY_Device_IsPresent`), and has a bound driver.
-pub fn probe_installed() -> Result<bool, String> {
+/// Checks whether the standalone `ROOT\QUARBORUNIVERSALKEYBOARDOUTPUT\AXONKEYMOBILE`
+/// devnode specifically exists and is bound.
+pub fn probe_standalone_vhid_installed() -> Result<bool, String> {
     let set = DeviceSet(
         unsafe { SetupDiCreateDeviceInfoList(Some(&HID_CLASS), None) }
             .map_err(|e| format!("无法创建设备信息集：{e}"))?,
@@ -258,8 +248,53 @@ pub fn probe_installed() -> Result<bool, String> {
     Ok(is_devnode_present(&set, &info) && has_bound_driver(&set, &info))
 }
 
+fn probe_any_usable_quarbor_installed() -> bool {
+    if probe_standalone_vhid_installed().unwrap_or(false) {
+        return true;
+    }
+    crate::windows_driver_devices::list_present()
+        .map(|devices| devices.into_iter().any(|d| d.present && d.bound))
+        .unwrap_or(false)
+}
+
+/// Returns `(driver_installed, driver_connected)` for `axonkeyMobile` instances:
+/// - Immediately `(true, true)` when an in-process `ManagedQuarborChannel` (e.g. Xiaomi RC003)
+///   or direct Quarbor pipe is already connected.
+/// - Otherwise checks (with a 1.5s cache) whether EITHER `AXONKEYMOBILE` OR any online
+///   Quarbor-bound device exists in Windows PnP, enabling direct pipe connection if needed.
+pub fn driver_availability(any_mobile_enabled: bool) -> (bool, bool) {
+    if crate::input_service::mobile_quarbor::is_connected() {
+        return (true, true);
+    }
+    const TTL: Duration = Duration::from_millis(1500);
+    let installed = if let Ok(guard) = PROBE_CACHE.lock() {
+        if let Some((at, cached)) = *guard {
+            if at.elapsed() < TTL {
+                Some(cached)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+    .unwrap_or_else(|| {
+        let fresh = probe_any_usable_quarbor_installed();
+        if let Ok(mut guard) = PROBE_CACHE.lock() {
+            *guard = Some((Instant::now(), fresh));
+        }
+        fresh
+    });
+
+    crate::input_service::mobile_quarbor::set_connect_enabled(installed && any_mobile_enabled);
+    let connected = installed && crate::input_service::mobile_quarbor::is_connected();
+    (installed, connected)
+}
+
 pub fn find_driver_inf(resource_dir: &Path) -> Result<PathBuf, String> {
-    let installer = crate::quarbor_installer::find(resource_dir)?;
+    let installer = normalize_win32_path(crate::quarbor_installer::find(resource_dir)?);
     let dir = installer
         .parent()
         .ok_or_else(|| "无法解析 Quarbor 驱动目录。".to_string())?;
@@ -269,7 +304,7 @@ pub fn find_driver_inf(resource_dir: &Path) -> Result<PathBuf, String> {
         dir.join(DRIVER_INF_NAME),
     ] {
         if candidate.is_file() {
-            return Ok(candidate);
+            return Ok(normalize_win32_path(candidate));
         }
     }
     Err(format!("未找到 Quarbor 签名驱动包：{DRIVER_INF_NAME}"))
@@ -280,16 +315,61 @@ fn last_win32_error(context: &str) -> String {
     format!("{context}（Win32 错误码 0x{code:08X} / {code}）")
 }
 
-fn execute_elevated_install(inf_path: &Path) -> Result<(bool, bool), String> {
-    if !inf_path.is_file() {
-        return Err(format!("驱动 INF 文件不存在：{}", inf_path.display()));
+/// Creates the in-memory `SP_DEVINFO_DATA` for `ROOT\QUARBORUNIVERSALKEYBOARDOUTPUT\AXONKEYMOBILE`
+/// and populates `SPDRP_HARDWAREID`. Separated so unit tests can verify SetupAPI acceptance
+/// directly without Administrator elevation.
+fn create_vhid_devinfo_in_set(set: &DeviceSet) -> Result<SP_DEVINFO_DATA, String> {
+    // IMPORTANT: Without DICD_GENERATE_ID, SetupDiCreateDeviceInfoW requires the full
+    // three-segment Root-enumerated instance ID ("ROOT\\QUARBORUNIVERSALKEYBOARDOUTPUT\\AXONKEYMOBILE");
+    // omitting "ROOT\\" fails with ERROR_INVALID_DEVINST_NAME (0xE0000205).
+    let full_instance_w = to_wide_null(MOBILE_VHID_INSTANCE_ID);
+    let desc_w = to_wide_null(MOBILE_VHID_DESCRIPTION);
+    let mut info = SP_DEVINFO_DATA {
+        cbSize: size_of::<SP_DEVINFO_DATA>() as u32,
+        ..Default::default()
+    };
+    let created = unsafe {
+        SetupDiCreateDeviceInfoW(
+            set.0 .0,
+            full_instance_w.as_ptr(),
+            &HID_CLASS,
+            desc_w.as_ptr(),
+            null_mut(),
+            DICD_INHERIT_CLASSDRVS,
+            &mut info,
+        ) != 0
+    };
+    if !created {
+        return Err(last_win32_error("创建虚拟 HID 设备节点失败"));
     }
-    let inf_dir = inf_path
+
+    let hwid_multi = to_multi_sz_bytes(MOBILE_VHID_HARDWARE_ID);
+    let prop_ok = unsafe {
+        SetupDiSetDeviceRegistryPropertyW(
+            set.0 .0,
+            &mut info,
+            SPDRP_HARDWAREID_RAW,
+            hwid_multi.as_ptr(),
+            hwid_multi.len() as u32,
+        ) != 0
+    };
+    if !prop_ok {
+        return Err(last_win32_error("写入虚拟 HID 硬件 ID 失败"));
+    }
+    Ok(info)
+}
+
+fn execute_elevated_install(inf_path: &Path) -> Result<(bool, bool), String> {
+    let clean_inf = normalize_win32_path(inf_path.to_path_buf());
+    if !clean_inf.is_file() {
+        return Err(format!("驱动 INF 文件不存在：{}", clean_inf.display()));
+    }
+    let inf_dir = clean_inf
         .parent()
         .ok_or_else(|| "无效的 INF 父目录".to_string())?;
 
     // 1. Stage signed QuarborUniversalKeyboardDriver.inf into Windows DriverStore without touching existing devices.
-    let inf_w = to_wide_null(&inf_path.to_string_lossy());
+    let inf_w = to_wide_null(&clean_inf.to_string_lossy());
     let inf_dir_w = to_wide_null(&inf_dir.to_string_lossy());
     let staged = unsafe {
         SetupCopyOEMInfW(
@@ -327,51 +407,25 @@ fn execute_elevated_install(inf_path: &Path) -> Result<(bool, bool), String> {
     if opened {
         if is_devnode_present(&set, &info) {
             already_existed = true;
+            let hwid_multi = to_multi_sz_bytes(MOBILE_VHID_HARDWARE_ID);
+            let _ = unsafe {
+                SetupDiSetDeviceRegistryPropertyW(
+                    set.0 .0,
+                    &mut info,
+                    SPDRP_HARDWAREID_RAW,
+                    hwid_multi.as_ptr(),
+                    hwid_multi.len() as u32,
+                )
+            };
         } else {
             let mut dummy_reboot = 0i32;
             let _ =
                 unsafe { DiUninstallDevice(null_mut(), set.0 .0, &mut info, 0, &mut dummy_reboot) };
-            info = SP_DEVINFO_DATA {
-                cbSize: size_of::<SP_DEVINFO_DATA>() as u32,
-                ..Default::default()
-            };
         }
     }
 
     if !already_existed {
-        let subpath_w = to_wide_null(MOBILE_VHID_SUBPATH);
-        let desc_w = to_wide_null(MOBILE_VHID_DESCRIPTION);
-        let created = unsafe {
-            SetupDiCreateDeviceInfoW(
-                set.0 .0,
-                subpath_w.as_ptr(),
-                &HID_CLASS,
-                desc_w.as_ptr(),
-                null_mut(),
-                DICD_INHERIT_CLASSDRVS,
-                &mut info,
-            ) != 0
-        };
-        if !created {
-            return Err(last_win32_error("创建虚拟 HID 设备节点失败"));
-        }
-    }
-
-    let hwid_multi = to_multi_sz_bytes(MOBILE_VHID_HARDWARE_ID);
-    let prop_ok = unsafe {
-        SetupDiSetDeviceRegistryPropertyW(
-            set.0 .0,
-            &mut info,
-            SPDRP_HARDWAREID_RAW,
-            hwid_multi.as_ptr(),
-            hwid_multi.len() as u32,
-        ) != 0
-    };
-    if !prop_ok {
-        return Err(last_win32_error("写入虚拟 HID 硬件 ID 失败"));
-    }
-
-    if !already_existed {
+        info = create_vhid_devinfo_in_set(&set)?;
         let registered =
             unsafe { SetupDiCallClassInstaller(DIF_REGISTERDEVICE_RAW, set.0 .0, &mut info) != 0 };
         if !registered {
@@ -454,7 +508,7 @@ pub fn maybe_run_from_cli_args() -> Option<i32> {
                     exit_code: if reboot_required { 3010 } else { 0 },
                     reboot_required,
                     already_existed,
-                    installed: probe_installed().unwrap_or(true),
+                    installed: probe_standalone_vhid_installed().unwrap_or(true),
                     message: "Axonkey Mobile 虚拟 HID 驱动安装成功。".into(),
                 },
                 Err(err) => AdminWorkerReply {
@@ -464,7 +518,7 @@ pub fn maybe_run_from_cli_args() -> Option<i32> {
                     exit_code: 1,
                     reboot_required: false,
                     already_existed: false,
-                    installed: probe_installed().unwrap_or(false),
+                    installed: probe_standalone_vhid_installed().unwrap_or(false),
                     message: err,
                 },
             },
@@ -497,7 +551,7 @@ pub fn maybe_run_from_cli_args() -> Option<i32> {
                 exit_code: 1,
                 reboot_required: false,
                 already_existed: false,
-                installed: probe_installed().unwrap_or(false),
+                installed: probe_standalone_vhid_installed().unwrap_or(false),
                 message: err,
             },
         },
@@ -535,7 +589,9 @@ pub(crate) fn run_admin_action(
     if !matches!(action, "install" | "uninstall") {
         return Err("不支持的虚拟 HID 驱动操作。".into());
     }
-    let current_exe = std::env::current_exe().map_err(|e| format!("无法定位当前程序路径：{e}"))?;
+    let current_exe = normalize_win32_path(
+        std::env::current_exe().map_err(|e| format!("无法定位当前程序路径：{e}"))?,
+    );
     let inf_path = if action == "install" {
         Some(find_driver_inf(resource_dir)?)
     } else {
@@ -657,15 +713,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn encodes_double_null_terminated_hardware_id_multi_sz() {
+    fn encodes_double_null_terminated_hardware_id_multi_sz_and_strips_verbatim_prefix() {
         let bytes = to_multi_sz_bytes("ABC");
         assert_eq!(bytes, vec![b'A', 0, b'B', 0, b'C', 0, 0, 0, 0, 0]);
+        assert_eq!(
+            normalize_win32_path(PathBuf::from(r"\\?\D:\workspace\axonkey\driver.inf")),
+            PathBuf::from(r"D:\workspace\axonkey\driver.inf")
+        );
     }
 
     #[test]
-    fn locates_bundled_signed_quarbor_inf() {
+    fn locates_bundled_signed_quarbor_inf_without_verbatim_prefix() {
         let resources = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         let inf = find_driver_inf(&resources).expect("QuarborUniversalKeyboardDriver.inf");
         assert!(inf.is_file());
+        assert!(!inf.to_string_lossy().starts_with(r"\\?\"));
+    }
+
+    #[test]
+    fn setupdi_validates_root_enumerated_instance_id_syntax() {
+        // SetupDiCreateDeviceInfoW validates DeviceName syntax BEFORE touching HKLM\...\Enum\ROOT:
+        // - A 2-segment name without "ROOT\\" fails immediately with 0xE0000205 (ERROR_INVALID_DEVINST_NAME).
+        // - Full "ROOT\\QUARBORUNIVERSALKEYBOARDOUTPUT\\AXONKEYMOBILE" passes syntax validation
+        //   (returning Ok(_) when elevated, or 0x00000005 ERROR_ACCESS_DENIED when non-elevated).
+        let set = DeviceSet(
+            unsafe { SetupDiCreateDeviceInfoList(Some(&HID_CLASS), None) }
+                .expect("SetupDiCreateDeviceInfoList"),
+        );
+        match create_vhid_devinfo_in_set(&set) {
+            Ok(mut info) => {
+                assert_eq!(info.ClassGuid, HID_CLASS);
+                let mut reboot = 0i32;
+                unsafe {
+                    let _ = DiUninstallDevice(null_mut(), set.0 .0, &mut info, 0, &mut reboot);
+                }
+            }
+            Err(err) => {
+                assert!(
+                    !err.contains("0xE0000205"),
+                    "Instance ID syntax must never fail with ERROR_INVALID_DEVINST_NAME: {err}"
+                );
+                assert!(
+                    err.contains("0x00000005"),
+                    "Expected only non-elevated ERROR_ACCESS_DENIED (5), got: {err}"
+                );
+            }
+        }
     }
 }

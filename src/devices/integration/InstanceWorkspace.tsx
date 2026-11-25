@@ -714,7 +714,7 @@ export function InstanceWorkspace({
           : driverRunning
             ? '正在安装按键驱动，请完成 Windows 管理员授权…'
             : isNetworkDevice
-              ? '尚未安装虚拟 HID 按键驱动（安装后可唤醒豆包语音等防注入全局热键）。'
+              ? '当前未检测到 Quarbor 按键驱动（安装后可支持唤醒豆包语音等防注入全局热键）。'
               : '按键驱动未安装，请先安装此设备的按键驱动。'
   if (profile.quick) {
     const quickTriggerBinding = findQuickOverlayTriggerBinding(instance, profile.id)

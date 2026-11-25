@@ -422,17 +422,13 @@ impl<B: MobileInputBackend + 'static> MobileHostHandle<B> {
             )
         };
         #[cfg(target_os = "windows")]
-        let vhid_installed = windows_vhid::cached_is_installed();
-        #[cfg(target_os = "windows")]
         let any_enabled = snapshot
             .store
             .instances
             .iter()
             .any(|i| i.kind == "axonkeyMobile" && i.enabled);
         #[cfg(target_os = "windows")]
-        crate::input_service::mobile_quarbor::set_connect_enabled(vhid_installed && any_enabled);
-        #[cfg(target_os = "windows")]
-        let vhid_connected = vhid_installed && crate::input_service::mobile_quarbor::is_connected();
+        let (vhid_installed, vhid_connected) = windows_vhid::driver_availability(any_enabled);
 
         for instance in &snapshot.store.instances {
             if instance.kind != "axonkeyMobile" {

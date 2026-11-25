@@ -1026,7 +1026,7 @@ async fn unbind_device_instance(
                 .iter()
                 .any(|inst| inst.kind == "axonkeyMobile" && inst.id != instance_id);
             if !remaining_other_mobile
-                && mobile_host::windows_vhid::probe_installed().unwrap_or(false)
+                && mobile_host::windows_vhid::probe_standalone_vhid_installed().unwrap_or(false)
             {
                 let resource_dir = app
                     .path()
@@ -1085,7 +1085,8 @@ async fn uninstall_bound_device_drivers(
     {
         use tauri::Manager;
 
-        let mobile_vhid_installed = mobile_host::windows_vhid::probe_installed().unwrap_or(false);
+        let mobile_vhid_installed =
+            mobile_host::windows_vhid::probe_standalone_vhid_installed().unwrap_or(false);
         let instance_ids = app
             .state::<DeviceManager>()
             .snapshot()
